@@ -1,0 +1,6 @@
+__pycache__/
+data/
+elec872_deepconvlstm/
+runs/
+
+submit.sh
