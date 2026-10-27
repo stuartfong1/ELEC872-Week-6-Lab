@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 
 from data import SENSOR_SETS, class_names, load_split
@@ -34,6 +35,7 @@ def parse_args(argv=None):
     g.add_argument("--bidirectional", action="store_true")
     g.add_argument("--dropout", type=float, default=0.5)
     g = p.add_argument_group("training (defaults = paper)")
+    g.add_argument("--exp-name", type=str)
     g.add_argument("--epochs", type=int, default=100)
     g.add_argument("--patience", type=int, default=20, help="early stopping on val weighted F1 (0 = off)")
     g.add_argument("--batch-size", type=int, default=100)
@@ -41,9 +43,11 @@ def parse_args(argv=None):
     g.add_argument("--lr", type=float, default=1e-3)
     g.add_argument("--rho", type=float, default=0.9, help="RMSProp decay factor")
     g.add_argument("--weight-decay", type=float, default=0.0)
+    g.add_argument("--warmup", action="store_true", help="linear learning-rate warmup schedule")
     g.add_argument("--cosine", action="store_true", help="cosine learning-rate schedule")
     g.add_argument("--class-weights", choices=["none", "inverse", "sqrt_inverse"], default="none")
     g.add_argument("--label-smoothing", type=float, default=0.0)
+    g.add_argument("--focal-loss", action="store_true", help="focal loss for classification")
     g.add_argument("--augment", action="store_true", help="random jitter + per-channel scaling")
     g.add_argument("--select-on", choices=["f1_weighted", "f1_macro"], default="f1_weighted",
                    help="validation metric used to pick the best epoch")
@@ -112,6 +116,39 @@ def class_weight_tensor(y, n_classes, mode, device):
         w = w.sqrt()
     return (w / w.mean()).to(device)
 
+def focal_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Focal loss.
+
+    Parameters
+    ----------
+    pred : torch.Tensor
+        Model predictions
+    target : torch.Tensor
+        Ground truth labels
+
+    Returns
+    -------
+    loss : torch.Tensor
+        Focal loss between the prediction and the target
+
+    References
+    ----------
+    [1] Lin et al. Focal Loss for Dense Object Detection. In ICCV, 2017.
+
+    """
+    log_probs = F.log_softmax(pred, dim=-1)
+    probs = torch.exp(log_probs)
+    target = F.one_hot(target, num_classes=probs.shape[-1]).float()
+    log_probs = (log_probs * target).sum(dim=1)
+    probs = (probs * target).sum(dim=1)
+
+    focal_weight = (1 - probs) ** 2
+    loss = -(focal_weight.unsqueeze(1) * target * log_probs.unsqueeze(1)).sum(dim=1)
+
+    return loss.mean()
 
 def save_plots(out, hist, cm, names):
     try:
@@ -163,7 +200,7 @@ def main(argv=None):
     set_seed(a.seed)
     device = get_device(a.device)
     tag = a.name or (f"{a.model}_{a.task}{'_nonull' if a.no_null else ''}_{a.sensors}"
-                     f"_w{a.window}_c{a.n_conv}_s{a.seed}")
+                     f"_w{a.window}_c{a.n_conv}_s{a.seed}_{a.exp_name}")
     out = a.out or os.path.join("runs", tag)
     os.makedirs(out, exist_ok=True)
 
@@ -187,9 +224,14 @@ def main(argv=None):
         opt = torch.optim.RMSprop(model.parameters(), lr=a.lr, alpha=a.rho, weight_decay=a.weight_decay)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs) if a.cosine else None
+    num_iterations_per_epoch = len(ytr) // a.batch_size
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs * num_iterations_per_epoch) if a.cosine else None
+    if a.warmup:
+        sched = torch.optim.lr_scheduler.LinearLR(opt, start_factor=2e-4 * num_iterations_per_epoch, total_iters=5 * num_iterations_per_epoch)
     weights = class_weight_tensor(ytr, len(names), a.class_weights, device)
     crit = nn.CrossEntropyLoss(weight=weights, label_smoothing=a.label_smoothing)
+    if a.focal_loss:
+        crit = focal_loss
 
     ckpt_path = os.path.join(out, "best_model.pt")
     best, best_epoch, hist = -1.0, 0, []
@@ -208,8 +250,8 @@ def main(argv=None):
             loss.backward()
             opt.step()
             tot += loss.item() * len(y)
-        if sched:
-            sched.step()
+            if sched:
+                sched.step()
         yv, pv, vloss = predict(model, Xva, yva)
         s = scores(yv, pv)
         hist.append({"epoch": epoch, "train_loss": tot / len(ytr), "val_loss": vloss,
